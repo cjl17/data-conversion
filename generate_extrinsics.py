@@ -3,6 +3,7 @@
 import numpy as np
 import yaml
 import argparse
+import json
 
 # 从YAML文件加载数据
 def load_yaml_data(file_path):
@@ -52,16 +53,37 @@ def print_transformation_matrix(matrix):
     for row in matrix:
         print([f"{val:.3f}" for val in row])
 
+# 保存变换矩阵到 JSON 文件中
+def save_to_json(output_file, transformation_matrix):
+    with open(output_file, 'r') as file:
+        data = json.load(file)
+    
+    # 将变换矩阵保存为 extrinsic 部分，矩阵按行展平
+    extrinsic = transformation_matrix.flatten().tolist()
+
+    # 更新 extrinsic 数据
+    data['extrinsic'] = extrinsic
+    # 更新 translation 数据
+    data['translation'] = transformation_matrix[:3, 3].tolist()  # 直接访问第4列
+    
+    # 保存更新后的数据
+    with open(output_file, 'w') as file:
+        json.dump(data, file, indent=4)
+    
+    print(f"Transformation matrix saved to {output_file}")
+
 # 解析命令行参数
 def parse_args():
-    parser = argparse.ArgumentParser(description="计算相机变换矩阵")
+    parser = argparse.ArgumentParser(description="计算相机变换矩阵并保存到 JSON 文件")
     parser.add_argument('camera', type=str, help="指定要计算变换矩阵的相机，如 camera0、camera1、camera2 等")
+    parser.add_argument('output_file', type=str, help="指定输出的 JSON 文件路径")
     return parser.parse_args()
 
 def main():
     # 解析命令行参数
     args = parse_args()
     camera = args.camera
+    output_file = args.output_file
 
     # 加载 base_link 和相机数据的文件
     base_link_file = '/home/nvidia/pix/ros2log/bev_20250812_151102_data/parameter/sensor_kit/robobus_sensor_kit_description/extrinsic_parameters/sensors_calibration.yaml'
@@ -96,6 +118,9 @@ def main():
         # 打印结果，保留三位小数
         print(f"{camera} -> Camera Transformation Matrix:")
         print_transformation_matrix(T_base_to_camera)
+
+        # 将变换矩阵保存到指定的 JSON 文件
+        save_to_json(output_file, T_base_to_camera)
     else:
         print(f"Error: {camera_link} not found in YAML data.")
 
