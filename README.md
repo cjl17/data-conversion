@@ -67,3 +67,34 @@ camera0 -> Camera Transformation Matrix:
 ['-0.010', '0.999', '0.005', '0.100']
 ['0.030', '-0.005', '0.999', '0.800']
 ['0.000', '0.000', '0.000', '1.000']
+# DB3 to YAML Converter (10 Hz)
+
+## 功能
+该脚本用于从 ROS2 `.db3` 数据库中提取 GNSS/IMU/Twist 数据，并生成固定 10Hz 的 YAML 文件，方便后续分析或标注使用。
+
+每个 YAML 文件包含：
+- Pose（位置 + 四元数旋转）
+- Twist（线速度 + 角速度）
+- IMU 角速度（缺失时补零）
+- Covariance（位姿和速度协方差）
+- 时间戳
+
+---
+
+## 文件说明
+- `db3_to_yaml.py` ：主脚本
+- `requirements.txt` ：Python 依赖
+- `sample_db/` ：可选测试数据库
+- `output_yaml/` ：默认输出目录
+
+---
+
+## 使用方法
+
+```bash
+git clone <你的仓库地址>
+cd sensor_data_yaml
+pip3 install -r requirements.txt
+
+# 运行脚本
+python3 db3_to_yaml.py path/to/your.db3
