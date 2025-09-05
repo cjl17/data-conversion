@@ -7,9 +7,10 @@ from std_srvs.srv import SetBool
 import yaml
 from pathlib import Path
 import math
+import argparse
 
 # ---------------- 可修改参数 ----------------
-DATA_PER_FOLDER =  1000        # 每个文件夹包含多少条数据
+DATA_PER_FOLDER = 1000         # 每个文件夹包含多少条数据
 ENABLE_MS_FILTER = True        # 是否按整百毫秒输出
 # ------------------------------------------
 
@@ -162,8 +163,13 @@ class LocalizationExporter(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    outdir = "/tmp/pointcloud_data"
-    node = LocalizationExporter(outdir)
+
+    parser = argparse.ArgumentParser(description="Localization Data Exporter")
+    parser.add_argument("--outdir", type=str, default="/tmp/pointcloud_data",
+                        help="输出目录路径 (默认: /tmp/pointcloud_data)")
+    cli_args = parser.parse_args()
+
+    node = LocalizationExporter(cli_args.outdir)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
