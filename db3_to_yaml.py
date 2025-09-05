@@ -1,175 +1,121 @@
 #!/usr/bin/env python3
-import sqlite3
-import sys
-import os
-from pathlib import Path
 import rclpy
-from rclpy.serialization import deserialize_message
-from rosidl_runtime_py.utilities import get_message
+from rclpy.node import Node
+from sensor_msgs.msg import NavSatFix, Imu
+from geometry_msgs.msg import PoseWithCovarianceStamped, TwistWithCovarianceStamped
 import yaml
-import bisect
+from pathlib import Path
 import math
 
-# ---------------- 可修改参数 ----------------
-DATA_PER_FOLDER = 200  # 每个文件夹包含多少条数据
-# ------------------------------------------
+# ---------------- 配置 ----------------
+OUTDIR = Path("output")   # 输出目录
+ENABLE_MS33_FILTER = True  # 是否启用 ms33 筛选逻辑（仿 C++）
+SAVE_FREQ = 100.0          # 保存频率 (Hz)
+# --------------------------------------
 
 def quaternion_to_yaw(q):
-    """
-    从四元数转换为航向角（yaw）
-    """
-    siny_cosp = 2 * (q.w * q.z + q.x * q.y)
-    cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+    """四元数 -> 偏航角 yaw"""
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny_cosp, cosy_cosp)
 
-def rotate_to_map(x_car, y_car, yaw):
-    """
-    将自车坐标系下的速度/加速度数据转换到 MAP 坐标系
-    """
-    x_map = math.cos(yaw) * x_car - math.sin(yaw) * y_car
-    y_map = math.sin(yaw) * x_car + math.cos(yaw) * y_car
-    return x_map, y_map
+def rotate_to_map(x, y, yaw):
+    """将局部坐标系下的速度/加速度旋转到地图坐标系"""
+    cos_y = math.cos(yaw)
+    sin_y = math.sin(yaw)
+    return cos_y * x - sin_y * y, sin_y * x + cos_y * y
 
-def main(db3_file):
-    if not os.path.exists(db3_file):
-        print(f"文件不存在: {db3_file}")
-        sys.exit(1)
+class LocalizationLogger(Node):
+    def __init__(self):
+        super().__init__('localization_logger')
 
-    # 输出路径固定为输入文件夹下 localization
-    db3_path = Path(db3_file).parent
-    outdir = db3_path / "localization"
-    outdir.mkdir(exist_ok=True)
+        # 订阅话题
+        self.sub_pose = self.create_subscription(
+            PoseWithCovarianceStamped, "/sensing/gnss/pose_with_covariance", self.pose_callback, 10)
+        self.sub_pose_position = self.create_subscription(
+            NavSatFix, "/sensing/gnss/fix", self.pose_position_callback, 10)
+        self.sub_twist = self.create_subscription(
+            TwistWithCovarianceStamped, "/localization/twist_estimator/twist_with_covariance", self.twist_callback, 10)
+        self.sub_imu = self.create_subscription(
+            Imu, "/sensing/imu/imu_data", self.imu_callback, 10)
 
-    rclpy.init()
-    conn = sqlite3.connect(db3_file)
-    cursor = conn.cursor()
+        # 存储数据
+        self.pose = None
+        self.pose_position = None
+        self.twist = None
+        self.imu = None
 
-    # 获取 topic id
-    cursor.execute("SELECT id, name FROM topics")
-    topics = {name: id for id, name in cursor.fetchall()}
+        # 定时保存 (100 Hz)
+        self.timer = self.create_timer(1.0 / SAVE_FREQ, self.timer_callback)
 
-    need_topics = {
-        "pose_position": "/sensing/gnss/fix",  # 用于获取位置（经纬度）
-        "pose": "/sensing/gnss/pose_with_covariance",  # 用于获取方向（四元数）
-        "twist": "/localization/twist_estimator/twist_with_covariance",
-        "imu": "/sensing/imu/imu_data"
-    }
+        # 输出目录
+        OUTDIR.mkdir(exist_ok=True)
 
-    for key in ["pose", "twist", "pose_position"]:
-        if need_topics[key] not in topics:
-            print(f"缺少topic: {need_topics[key]}")
-            sys.exit(1)
+    def pose_callback(self, msg):
+        self.pose = msg
 
-    imu_exists = need_topics["imu"] in topics
+    def pose_position_callback(self, msg):
+        self.pose_position = msg
 
-    # 消息类型
-    msg_types = {
-        "pose_position": "sensor_msgs/msg/NavSatFix",  # 位置数据（经纬度）
-        "pose": "geometry_msgs/msg/PoseWithCovarianceStamped",  # 方向数据（四元数）
-        "twist": "geometry_msgs/msg/TwistWithCovarianceStamped",
-        "imu": "sensor_msgs/msg/Imu"
-    }
-    msg_classes = {k: get_message(v) for k, v in msg_types.items()}
+    def twist_callback(self, msg):
+        self.twist = msg
 
-    # 读取并排序
-    all_data = {"pose": [], "twist": [], "imu": [], "pose_position": []}
-    for key in all_data.keys():
-        if key not in need_topics or need_topics[key] not in topics:
-            continue
-        tid = topics[need_topics[key]]
-        for row in cursor.execute(f"SELECT timestamp, data FROM messages WHERE topic_id={tid}"):
-            ts = row[0] / 1e9
-            msg = deserialize_message(row[1], msg_classes[key])
-            all_data[key].append((ts, msg))
-        all_data[key].sort(key=lambda x: x[0])
+    def imu_callback(self, msg):
+        self.imu = msg
 
-    # 二分查找最近时间戳
-    def find_closest(data_list, target_ts):
-        if not data_list:
-            return None
-        timestamps = [ts for ts, _ in data_list]
-        pos = bisect.bisect_left(timestamps, target_ts)
-        if pos == 0:
-            return data_list[0][1]
-        if pos >= len(data_list):
-            return data_list[-1][1]
-        before_ts, before_msg = data_list[pos-1]
-        after_ts, after_msg = data_list[pos]
-        if abs(before_ts - target_ts) <= abs(after_ts - target_ts):
-            return before_msg
-        else:
-            return after_msg
+    def timer_callback(self):
+        if not self.pose or not self.pose_position or not self.twist:
+            self.get_logger().warn("等待 pose/pose_position/twist 数据...")
+            return
 
-    # 输出 YAML（10 Hz）
-    if not all_data["pose"]:
-        print("❌ pose 数据为空，无法生成 YAML 文件")
-        rclpy.shutdown()
-        sys.exit(1)
+        now = self.get_clock().now()
+        ts = now.nanoseconds / 1e9
 
-    start_ts = all_data["pose"][0][0]
-    end_ts = all_data["pose"][-1][0]
-    freq = 10.0  # Hz
-    dt = 1.0 / freq
+        # -------- 模仿 C++ 逻辑 --------
+        if ENABLE_MS33_FILTER:
+            nanosec = now.nanoseconds % int(1e9)   # 秒内纳秒数
+            ms = nanosec / 1e6                     # 转毫秒
+            ms33 = ms if ms < 10.0 else math.fmod(ms, 10.0)
+            if not (0.0 <= ms33 <= 10.0):
+                return   # 不在时间窗口，直接跳过
+        # --------------------------------
 
-    count = 0
-    folder_idx = 0
-    ts = start_ts
-
-    # 创建第一个文件夹
-    current_folder = outdir / f"{folder_idx}"
-    current_folder.mkdir(exist_ok=True)
-
-    while ts <= end_ts:
-        # 每 DATA_PER_FOLDER 条数据创建一个新文件夹
-        if count > 0 and count % DATA_PER_FOLDER == 0:
-            folder_idx += 1
-            current_folder = outdir / f"{folder_idx}"
-            current_folder.mkdir(exist_ok=True)
-
-        # 获取GNSS数据
-        position_msg = find_closest(all_data["pose_position"], ts)
-        latitude = position_msg.latitude
-        longitude = position_msg.longitude
-        altitude = position_msg.altitude
-
-        # 获取pose数据（方向）
-        pose_msg = find_closest(all_data["pose"], ts)
-        orientation = pose_msg.pose.pose.orientation
-
-        # 获取IMU数据
-        imu_msg = find_closest(all_data["imu"], ts) if imu_exists else None
-        angularV = {"x": 0.0, "y": 0.0, "z": 0.0}
-        if imu_msg:
-            angularV = {
-                "x": float(imu_msg.angular_velocity.x),
-                "y": float(imu_msg.angular_velocity.y),
-                "z": float(imu_msg.angular_velocity.z)
-            }
-
-        # Twist（速度与加速度）
-        twist_msg = find_closest(all_data["twist"], ts)
-        vel = twist_msg.twist.twist.linear if twist_msg else None
-        acc = twist_msg.twist.twist.angular if twist_msg else None
-
-        # 计算航向角（yaw）
+        orientation = self.pose.pose.pose.orientation
         yaw = quaternion_to_yaw(orientation)
 
-        # 将速度和加速度从自车坐标系转换到 MAP 坐标系
-        vel_x_map, vel_y_map = rotate_to_map(vel.x if vel else 0.0, vel.y if vel else 0.0, yaw)
-        acc_x_map, acc_y_map = rotate_to_map(acc.x if acc else 0.0, acc.y if acc else 0.0, yaw)
+        vel = self.twist.twist.twist.linear
+        acc = self.twist.twist.twist.angular
+        vel_x_map, vel_y_map = rotate_to_map(vel.x, vel.y, yaw)
+        acc_x_map, acc_y_map = rotate_to_map(acc.x, acc.y, yaw)
 
-        # Covariance 转 float 列表
-        posCov = [float(x) for x in pose_msg.pose.covariance] if hasattr(pose_msg.pose, "covariance") else [0.0]*36
-        velCov = [float(x) for x in twist_msg.twist.covariance] if twist_msg and hasattr(twist_msg.twist, "covariance") else [0.0]*9
+        angularV = {"x": 0.0, "y": 0.0, "z": 0.0}
+        if self.imu:
+            angularV = {
+                "x": float(self.imu.angular_velocity.x),
+                "y": float(self.imu.angular_velocity.y),
+                "z": float(self.imu.angular_velocity.z)
+            }
+
+        posCov = [float(x) for x in self.pose.pose.covariance] if hasattr(self.pose.pose, "covariance") else [0.0]*36
+        velCov = [float(x) for x in self.twist.twist.covariance] if hasattr(self.twist.twist, "covariance") else [0.0]*9
 
         entry = {
             "header": {"frameId": "vehicle-lidar", "timestampSec": ts},
             "pose": {
-                "orientation": {"x": float(orientation.x), "y": float(orientation.y), "z": float(orientation.z), "w": float(orientation.w)},
-                "position": {"x": float(longitude), "y": float(latitude), "z": float(altitude)}
+                "orientation": {
+                    "x": float(orientation.x),
+                    "y": float(orientation.y),
+                    "z": float(orientation.z),
+                    "w": float(orientation.w)
+                },
+                "position": {
+                    "x": float(self.pose_position.longitude),
+                    "y": float(self.pose_position.latitude),
+                    "z": float(self.pose_position.altitude)
+                }
             },
-            "vel": {"x": vel_x_map, "y": vel_y_map, "z": float(vel.z) if vel else 0.0},
-            "acc": {"x": acc_x_map, "y": acc_y_map, "z": float(acc.z) if acc else 0.0},
+            "vel": {"x": vel_x_map, "y": vel_y_map, "z": float(vel.z)},
+            "acc": {"x": acc_x_map, "y": acc_y_map, "z": float(acc.z)},
             "angularV": angularV,
             "consistencyToMap": 1.0,
             "mode": 1,
@@ -180,17 +126,18 @@ def main(db3_file):
             "velCov": velCov
         }
 
-        with open(current_folder / f"{int(ts*1e2)}.yaml", "w") as f:
+        filename = OUTDIR / f"{int(ts*1e2)}.yaml"
+        with open(filename, "w") as f:
             yaml.dump(entry, f, sort_keys=False)
 
-        count += 1
-        ts += dt
+        self.get_logger().info(f"✅ 保存 {filename}")
 
-    print(f"✅ 已生成 {count} 个 yaml 文件，分布在 {folder_idx+1} 个文件夹中，保存在 {outdir}/")
+def main(args=None):
+    rclpy.init(args=args)
+    node = LocalizationLogger()
+    rclpy.spin(node)
+    node.destroy_node()
     rclpy.shutdown()
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("用法: ./123.py your.db3")
-        sys.exit(2)
-    main(sys.argv[1])
+if __name__ == '__main__':
+    main()
