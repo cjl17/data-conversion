@@ -54,4 +54,3 @@ if __name__ == "__main__":
     output_file_path = sys.argv[2]  # 从命令行参数获取输出文件路径
     
     main(input_file_path, output_file_path)
-
